@@ -147,23 +147,23 @@ static void *cc_conference_thread(void *data)
     /* Let the 202 response leave the wire before touching bridges */
     usleep(300000);
 
-    ch_held    = ast_channel_get_by_name(t->held_name);
+    ch_held = t->held_name[0] ? ast_channel_get_by_name(t->held_name) : NULL;
     ch_phone   = ast_channel_get_by_name(t->phone_name);
-    ch_consult = ast_channel_get_by_name(t->consult_name);
+    ch_consult = t->consult_name[0] ? ast_channel_get_by_name(t->consult_name) : NULL;
     ch_drop    = t->drop_name[0] ? ast_channel_get_by_name(t->drop_name) : NULL;
 
-    if (!ch_held || !ch_phone || !ch_consult) {
+    if (!ch_phone || (!ch_held && !ch_consult)) {
         ast_log(LOG_ERROR, "CiscoConf: channel(s) gone before conference could start\n");
         goto done;
     }
 
     ast_log(LOG_NOTICE,
         "CiscoConf: room='%s' held=%s phone=%s consult=%s\n",
-        t->room, t->held_name, t->phone_name, t->consult_name);
+        t->room, t->held_name[0] ? t->held_name : "(none)", t->phone_name, t->consult_name[0] ? t->consult_name : "(none)");
 
-    pbx_builtin_setvar_helper(ch_held,    "CISCO_CONF_ROOM", t->room);
+    if (ch_held) pbx_builtin_setvar_helper(ch_held, "CISCO_CONF_ROOM", t->room);
     pbx_builtin_setvar_helper(ch_phone,   "CISCO_CONF_ROOM", t->room);
-    pbx_builtin_setvar_helper(ch_consult, "CISCO_CONF_ROOM", t->room);
+    if (ch_consult) pbx_builtin_setvar_helper(ch_consult, "CISCO_CONF_ROOM", t->room);
 
     /*
      * Redirect channels to ConfBridge.
@@ -180,9 +180,9 @@ static void *cc_conference_thread(void *data)
      * ch_phone sees "callee gone" but also finds its own async_goto flag set
      * and follows to cisco-conference rather than running the hangup handler.
      */
-    ast_async_goto(ch_consult, CISCO_CONF_CONTEXT, CISCO_CONF_EXTEN, CISCO_CONF_PRIO);
+    if (ch_consult) ast_async_goto(ch_consult, CISCO_CONF_CONTEXT, CISCO_CONF_EXTEN, CISCO_CONF_PRIO);
     ast_async_goto(ch_phone,   CISCO_CONF_CONTEXT, CISCO_CONF_EXTEN, CISCO_CONF_PRIO);
-    ast_async_goto(ch_held,    CISCO_CONF_CONTEXT, CISCO_CONF_EXTEN, CISCO_CONF_PRIO);
+    if (ch_held) ast_async_goto(ch_held, CISCO_CONF_CONTEXT, CISCO_CONF_EXTEN, CISCO_CONF_PRIO);
 
     /*
      * ch_drop is the outgoing leg toward phone 220 for the first (held) call.
@@ -286,6 +286,9 @@ static pj_bool_t cisco_cc_on_rx_request(pjsip_rx_data *rdata)
     ast_log(LOG_NOTICE, "CiscoConf: Conference REFER — dialog='%s' consult='%s'\n",
         dlg_callid, con_callid);
 
+    char existing_conf[64] = "";
+    const char *ev;
+
     /* ---- channel lookup (done in PJSIP thread) --------------------- */
     /*
      * dialogid = held call (Asterisk outdialled phone 220).
@@ -295,12 +298,23 @@ static pj_bool_t cisco_cc_on_rx_request(pjsip_rx_data *rdata)
     ch_first = channel_for_dialog(dlg_callid, dlg_ltag, dlg_rtag);
     if (!ch_first) goto lookup_fail;
 
-    ch_held = ast_channel_bridge_peer(ch_first);
-    if (!ch_held) {
-        ast_log(LOG_ERROR, "CiscoConf: no bridge peer for '%s'\n",
-            ast_channel_name(ch_first));
-        ast_channel_unref(ch_first);
-        goto lookup_fail;
+    ast_channel_lock(ch_first);
+    ev = pbx_builtin_getvar_helper(ch_first, "CISCO_CONF_ROOM");
+    if (ev && ev[0] != '\0') {
+        ast_copy_string(existing_conf, ev, sizeof(existing_conf));
+    }
+    ast_channel_unlock(ch_first);
+
+    if (existing_conf[0] == '\0') {
+        ch_held = ast_channel_bridge_peer(ch_first);
+        if (!ch_held) {
+            ast_log(LOG_ERROR, "CiscoConf: no bridge peer for '%s'\n",
+                ast_channel_name(ch_first));
+            ast_channel_unref(ch_first);
+            goto lookup_fail;
+        }
+    } else {
+        ch_held = NULL; /* phone is already in a conference bridge */
     }
 
     /*
@@ -311,46 +325,65 @@ static pj_bool_t cisco_cc_on_rx_request(pjsip_rx_data *rdata)
     ch_second = channel_for_dialog(con_callid, con_ltag, con_rtag);
     if (!ch_second) {
         ast_channel_unref(ch_first);
-        ast_channel_unref(ch_held);
+        if (ch_held) ast_channel_unref(ch_held);
         goto lookup_fail;
     }
 
-    ch_consult = ast_channel_bridge_peer(ch_second);
-    if (!ch_consult) {
-        ast_log(LOG_ERROR, "CiscoConf: no bridge peer for '%s'\n",
-            ast_channel_name(ch_second));
-        ast_channel_unref(ch_first);
-        ast_channel_unref(ch_held);
-        ast_channel_unref(ch_second);
-        goto lookup_fail;
+    ast_channel_lock(ch_second);
+    ev = pbx_builtin_getvar_helper(ch_second, "CISCO_CONF_ROOM");
+    if (ev && ev[0] != '\0' && existing_conf[0] == '\0') {
+        ast_copy_string(existing_conf, ev, sizeof(existing_conf));
+    }
+    ast_channel_unlock(ch_second);
+
+    if (ev && ev[0] != '\0') {
+        ch_consult = NULL; /* phone is already in a conference bridge */
+    } else {
+        ch_consult = ast_channel_bridge_peer(ch_second);
+        if (!ch_consult) {
+            ast_log(LOG_ERROR, "CiscoConf: no bridge peer for '%s'\n",
+                ast_channel_name(ch_second));
+            ast_channel_unref(ch_first);
+            if (ch_held) ast_channel_unref(ch_held);
+            ast_channel_unref(ch_second);
+            goto lookup_fail;
+        }
     }
 
     /* ---- build thread task ----------------------------------------- */
     task = ast_calloc(1, sizeof(*task));
     if (!task) {
         ast_channel_unref(ch_first);
-        ast_channel_unref(ch_held);
+        if (ch_held) ast_channel_unref(ch_held);
         ast_channel_unref(ch_second);
-        ast_channel_unref(ch_consult);
+        if (ch_consult) ast_channel_unref(ch_consult);
         goto lookup_fail;
     }
 
-    ast_copy_string(task->held_name,    ast_channel_name(ch_held),    sizeof(task->held_name));
+    if (ch_held) {
+        ast_copy_string(task->held_name, ast_channel_name(ch_held), sizeof(task->held_name));
+    }
     ast_copy_string(task->phone_name,   ast_channel_name(ch_second),  sizeof(task->phone_name));
-    ast_copy_string(task->consult_name, ast_channel_name(ch_consult), sizeof(task->consult_name));
+    if (ch_consult) {
+        ast_copy_string(task->consult_name, ast_channel_name(ch_consult), sizeof(task->consult_name));
+    }
     ast_copy_string(task->drop_name,    ast_channel_name(ch_first),   sizeof(task->drop_name));
-    snprintf(task->room, sizeof(task->room), "cc%ld", (long)ast_tvnow().tv_sec);
+    
+    if (existing_conf[0] != '\0') {
+        ast_copy_string(task->room, existing_conf, sizeof(task->room));
+    } else {
+        snprintf(task->room, sizeof(task->room), "cc%ld", (long)ast_tvnow().tv_sec);
+    }
 
     ast_log(LOG_NOTICE,
         "CiscoConf: room=%s held=%s phone=%s consult=%s drop=%s\n",
-        task->room, task->held_name, task->phone_name,
-        task->consult_name, task->drop_name);
+        task->room, task->held_name[0] ? task->held_name : "(none)", task->phone_name,
+        task->consult_name[0] ? task->consult_name : "(none)", task->drop_name);
 
     ast_channel_unref(ch_first);
-    ast_channel_unref(ch_held);
+    if (ch_held) ast_channel_unref(ch_held);
     ast_channel_unref(ch_second);
-    ast_channel_unref(ch_consult);
-
+    if (ch_consult) ast_channel_unref(ch_consult);
     /* ---- send 202 Accepted ----------------------------------------- */
     if (pjsip_endpt_create_response(ast_sip_get_pjsip_endpoint(),
             rdata, 202, NULL, &resp) == PJ_SUCCESS)
