@@ -137,6 +137,193 @@ static struct ast_channel *channel_for_dialog(const char *call_id,
     return chan;
 }
 
+/* ---------- REFER NOTIFY (RFC 3515) ------------------------------------ */
+
+/*
+ * The Cisco "Conference" REFER is OUT-OF-DIALOG: it arrives with its own
+ * fresh Call-ID, a From tag but no To tag, and Request-URI pointing at
+ * the server address rather than a dialog URI.  The XML body carries
+ * <dialogid>/<consultdialogid> that merely REFERENCE the two existing
+ * call dialogs — those are untouched by the REFER itself.
+ *
+ * When we reply 202 Accepted, pjsip auto-adds a local To tag; together
+ * with the phone's From tag + the new Call-ID this forms a brand-new
+ * implicit subscription dialog (RFC 3515) that lives only for the
+ * refer-event.  The phone will keep its Conference softkey disabled
+ * until it receives a NOTIFY on that dialog whose Subscription-State
+ * is "terminated".  (CUCM actually sends two: "active;expires=60" first
+ * and a follow-up "terminated;reason=noresource" once the transfer is
+ * complete.  A single terminated NOTIFY is sufficient per RFC 3515.)
+ *
+ * Because no dialog exists on the Asterisk side (we never called
+ * pjsip_dlg_create_uas), we build and send the NOTIFY statelessly.
+ */
+static void cisco_cc_send_refer_notify(pjsip_rx_data *rdata,
+                                        const pj_str_t *local_tag)
+{
+    static const pjsip_method notify_method = {
+        PJSIP_OTHER_METHOD,
+        { "NOTIFY", 6 }
+    };
+    pjsip_endpoint *endpt = ast_sip_get_pjsip_endpoint();
+    pjsip_msg *msg = rdata->msg_info.msg;
+    pjsip_from_hdr *refer_from = rdata->msg_info.from;
+    pjsip_to_hdr   *refer_to   = rdata->msg_info.to;
+    pjsip_cid_hdr  *refer_cid  = rdata->msg_info.cid;
+    pjsip_contact_hdr *refer_contact;
+    pjsip_transport *tp = rdata->tp_info.transport;
+    pjsip_tx_data *tdata;
+    pj_status_t status;
+    pj_str_t target_s, from_s, to_s, contact_s, call_id_s;
+    pj_str_t hname, hval;
+    char target_buf[256], from_buf[512], to_buf[512];
+    char contact_buf[256];
+    int n;
+
+    if (!refer_from || !refer_to || !refer_cid || !tp || !local_tag
+        || local_tag->slen == 0) {
+        ast_log(LOG_WARNING,
+            "CiscoConf: cannot send refer-NOTIFY (missing headers/tag)\n");
+        return;
+    }
+
+    refer_contact = (pjsip_contact_hdr *)pjsip_msg_find_hdr(msg,
+        PJSIP_H_CONTACT, NULL);
+
+    /* Request-URI: phone's Contact URI, fallback to phone's From URI */
+    n = pjsip_uri_print(PJSIP_URI_IN_REQ_URI,
+        refer_contact ? refer_contact->uri
+                      : pjsip_uri_get_uri(refer_from->uri),
+        target_buf, sizeof(target_buf) - 1);
+    if (n <= 0) {
+        ast_log(LOG_WARNING, "CiscoConf: could not format NOTIFY target URI\n");
+        return;
+    }
+    target_buf[n] = '\0';
+    target_s.ptr  = target_buf;
+    target_s.slen = n;
+
+    /* From: REFER's To URI — NO tag here.  pjsip_endpt_create_request()
+     * parses this string with PJSIP_PARSE_URI_AS_NAMEADDR which only
+     * understands a name-addr (<...>) and rejects trailing ";tag=..."
+     * header parameters (returns 171051).  We patch the tag onto the
+     * pjsip_from_hdr struct directly after the request is created. */
+    n = pjsip_uri_print(PJSIP_URI_IN_FROMTO_HDR, refer_to->uri,
+        from_buf, sizeof(from_buf) - 1);
+    if (n <= 0) {
+        ast_log(LOG_WARNING, "CiscoConf: could not format NOTIFY From URI\n");
+        return;
+    }
+    from_buf[n] = '\0';
+    from_s.ptr  = from_buf;
+    from_s.slen = n;
+
+    /* To: REFER's From URI — tag also patched on the header struct below. */
+    n = pjsip_uri_print(PJSIP_URI_IN_FROMTO_HDR, refer_from->uri,
+        to_buf, sizeof(to_buf) - 1);
+    if (n <= 0) {
+        ast_log(LOG_WARNING, "CiscoConf: could not format NOTIFY To URI\n");
+        return;
+    }
+    to_buf[n] = '\0';
+    to_s.ptr  = to_buf;
+    to_s.slen = n;
+
+    /* Contact: local transport address.  NOTE: pjsip_transport.type_name is
+     * a C string (char *), not a pj_str_t — using pj_strlen on &type_name
+     * reads whatever struct field follows it as a length and produces a
+     * malformed header that pjsip rejects with PJSIP_EINVALIDURI (171051).
+     * Use %s here, and omit the transport parameter (it's optional in
+     * Contact and not required for the refer-NOTIFY to match). */
+    n = snprintf(contact_buf, sizeof(contact_buf),
+        "<sip:%.*s:%d>",
+        (int)tp->local_name.host.slen, tp->local_name.host.ptr,
+        tp->local_name.port);
+    contact_s.ptr  = contact_buf;
+    contact_s.slen = n;
+
+    call_id_s = refer_cid->id;
+
+    ast_log(LOG_DEBUG,
+        "CiscoConf: NOTIFY headers target='%.*s' from='%.*s' to='%.*s' "
+        "contact='%.*s' call-id='%.*s'\n",
+        (int)target_s.slen, target_s.ptr,
+        (int)from_s.slen,   from_s.ptr,
+        (int)to_s.slen,     to_s.ptr,
+        (int)contact_s.slen, contact_s.ptr,
+        (int)call_id_s.slen, call_id_s.ptr);
+
+    status = pjsip_endpt_create_request(endpt, &notify_method,
+        &target_s, &from_s, &to_s, &contact_s, &call_id_s,
+        -1 /* auto CSeq */, NULL, &tdata);
+    if (status != PJ_SUCCESS) {
+        ast_log(LOG_WARNING,
+            "CiscoConf: pjsip_endpt_create_request(NOTIFY) failed: %d "
+            "(target='%.*s' from='%.*s' to='%.*s' contact='%.*s')\n",
+            status,
+            (int)target_s.slen,  target_s.ptr,
+            (int)from_s.slen,    from_s.ptr,
+            (int)to_s.slen,      to_s.ptr,
+            (int)contact_s.slen, contact_s.ptr);
+        return;
+    }
+
+    /* Patch the From / To tags onto the already-parsed header structs so
+     * the NOTIFY matches the implicit subscription dialog that the phone
+     * created when we replied 202 Accepted to its REFER:
+     *   From-tag   = local tag pjsip generated for our 202
+     *   To-tag     = phone's From-tag from the REFER                     */
+    {
+        pjsip_from_hdr *f = (pjsip_from_hdr *)pjsip_msg_find_hdr(tdata->msg,
+            PJSIP_H_FROM, NULL);
+        pjsip_to_hdr   *t = (pjsip_to_hdr *)pjsip_msg_find_hdr(tdata->msg,
+            PJSIP_H_TO,   NULL);
+        if (f) pj_strdup(tdata->pool, &f->tag, local_tag);
+        if (t) pj_strdup(tdata->pool, &t->tag, &refer_from->tag);
+    }
+
+    /* Event: refer
+     *
+     * IMPORTANT: RFC 3515 §2.4.4 says that when the originating REFER did
+     * NOT carry an "id" parameter on its own (implicit) Event header, the
+     * NOTIFY MUST NOT include one either.  Cisco phones enforce this
+     * strictly: a NOTIFY with "Event: refer;id=<cseq>" is answered with
+     * "489 Bad Event" because it does not match the subscription that the
+     * phone actually tracks ("refer", no id).  This is exactly what CUCM
+     * sends on the wire as well, so we mirror that. */
+    hname = pj_str("Event");
+    hval  = pj_str("refer");
+    pjsip_msg_add_hdr(tdata->msg, (pjsip_hdr *)
+        pjsip_generic_string_hdr_create(tdata->pool, &hname, &hval));
+
+    /* Subscription-State: terminated;reason=noresource
+     *
+     * We are not actually maintaining a subscription state machine for
+     * this REFER, so immediately declaring the implicit subscription
+     * terminated ("noresource") is the RFC-legal way to tell the phone
+     * "the refer is done, drop the softkey lockout".  CUCM's reference
+     * NOTIFY for this Cisco proprietary remotecc REFER also carries no
+     * body (Content-Length: 0); a message/sipfrag body is allowed by
+     * RFC 3515 but unnecessary here, so we omit it to stay byte-compatible
+     * with the emulated CUCM implementation. */
+    hname = pj_str("Subscription-State");
+    hval  = pj_str("terminated;reason=noresource");
+    pjsip_msg_add_hdr(tdata->msg, (pjsip_hdr *)
+        pjsip_generic_string_hdr_create(tdata->pool, &hname, &hval));
+
+    status = pjsip_endpt_send_request_stateless(endpt, tdata, NULL, NULL);
+    if (status != PJ_SUCCESS) {
+        ast_log(LOG_WARNING,
+            "CiscoConf: pjsip_endpt_send_request_stateless(NOTIFY) failed: %d\n",
+            status);
+    } else {
+        ast_log(LOG_NOTICE,
+            "CiscoConf: sent terminated refer-NOTIFY (Call-ID=%.*s, local-tag=%.*s)\n",
+            (int)call_id_s.slen, call_id_s.ptr,
+            (int)local_tag->slen, local_tag->ptr);
+    }
+}
+
 /* ---------- conference worker thread ----------------------------------- */
 
 static void *cc_conference_thread(void *data)
@@ -385,12 +572,34 @@ static pj_bool_t cisco_cc_on_rx_request(pjsip_rx_data *rdata)
     ast_channel_unref(ch_second);
     if (ch_consult) ast_channel_unref(ch_consult);
     /* ---- send 202 Accepted ----------------------------------------- */
+    char local_tag_buf[128] = "";
+    pj_str_t local_tag = { NULL, 0 };
+
     if (pjsip_endpt_create_response(ast_sip_get_pjsip_endpoint(),
-            rdata, 202, NULL, &resp) == PJ_SUCCESS)
+            rdata, 202, NULL, &resp) == PJ_SUCCESS) {
+        pjsip_to_hdr *to_h = (pjsip_to_hdr *)pjsip_msg_find_hdr(
+            resp->msg, PJSIP_H_TO, NULL);
+        if (to_h && to_h->tag.slen > 0) {
+            int tlen = (int)to_h->tag.slen;
+            if (tlen > (int)sizeof(local_tag_buf) - 1)
+                tlen = sizeof(local_tag_buf) - 1;
+            memcpy(local_tag_buf, to_h->tag.ptr, tlen);
+            local_tag_buf[tlen] = '\0';
+            local_tag.ptr  = local_tag_buf;
+            local_tag.slen = tlen;
+        }
         pjsip_endpt_send_response2(ast_sip_get_pjsip_endpoint(),
             rdata, resp, NULL, NULL);
-    else
+    } else {
         ast_log(LOG_ERROR, "CiscoConf: could not create 202 response\n");
+    }
+
+    /* ---- terminate the REFER implicit subscription (RFC 3515) ------
+     * Mirror CUCM behaviour: immediately send a NOTIFY on the REFER
+     * dialog so the phone re-enables its Conference softkey.  Without
+     * this, the phone waits forever for a refer-NOTIFY and the button
+     * stays locked until a Hold/Unhold resets softkey state. */
+    cisco_cc_send_refer_notify(rdata, &local_tag);
 
     /* ---- spawn detached conference worker -------------------------- */
     pthread_attr_init(&attr);
